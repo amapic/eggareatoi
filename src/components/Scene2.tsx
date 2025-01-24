@@ -1,19 +1,24 @@
 import { OrbitControls, MeshTransmissionMaterial } from "@react-three/drei";
-import { Canvas, useFrame } from "@react-three/fiber";
+import { Canvas, useFrame, extend } from "@react-three/fiber";
 import { useMemo, useRef, useEffect, useState } from "react";
 import * as THREE from "three";
 import { useControls } from 'leva'
+import { EffectComposer, Bloom } from '@react-three/postprocessing';
 // import './scene.css';
 
+extend({ Bloom });
 const CustomGeometryParticles = (props) => {
   const { count } = props;
   const points = useRef();
   const referencePoints = useRef(); // Points de référence non affichés
+  const sphereRefs = useRef([]);
+  const lastResetTime = useRef(0);
   const [uniforms] = useState({
     uTime: { value: 0 },
     uMouse: { value: new THREE.Vector2(0.5, 0.5) }
   });
 
+  const leaderFrequency = 10000;
   // Tableau pour stocker les temps de dernière interaction pour chaque point
   const lastInteractionTimes = useRef(new Float32Array(count).fill(-1));
 
@@ -33,7 +38,7 @@ const CustomGeometryParticles = (props) => {
 
       gl_Position = projectedPosition;
       // La taille de base est multipliée par l'inverse de la distance à la caméra
-      gl_PointSize = 50.0 * (1.0 / -viewPosition.z);
+      gl_PointSize = 20.0 * (1.0 / -viewPosition.z);
       // gl_PointSize = 10.0;
     }
   `;
@@ -102,16 +107,18 @@ const CustomGeometryParticles = (props) => {
     const a = -5.5;
     const b = 3.5;
     const d = -1;
-    let timestep = 0.01;
-
-    if (currentTime > 10) {
-      timestep = 0.001;
-    }
+    let normalTimestep = 0.01;
+    let leaderTimestep = 0.01; // Timestep plus élevé pour les leaders
+     // Une particule sur 1000 sera un leader
     
+    if (currentTime > 10) {
+      normalTimestep = 0.001;
+      // leaderTimestep = 0.01;
+    }
     // Paramètres de dilatation et retour
     const dilationStrength = 0.3;
     const dilationRadius = 1.0;
-    const returnSpeed = 0.5; // Vitesse de retour (0 = pas de retour, 1 = retour rapide)
+    const returnSpeed = 0.5;
 
     // Setup raycaster
     const planeNormal = new THREE.Vector3(0, 0, 1);
@@ -122,10 +129,13 @@ const CustomGeometryParticles = (props) => {
 
     raycaster.setFromCamera(mouse, camera);
     raycaster.ray.intersectPlane(plane, mousePosition);
-    console.log(mousePosition.x, mousePosition.y)
     for (let i = 0; i < count; i++) {
       const i3 = i * 3;
       
+      // Déterminer si c'est une particule leader
+      const isLeader = i % leaderFrequency === 0;
+      const timestep = isLeader ? leaderTimestep : normalTimestep;
+
       // Position actuelle du point
       const pos = {
         x: points.current.geometry.attributes.position.array[i3],
@@ -140,7 +150,7 @@ const CustomGeometryParticles = (props) => {
         z: referencePoints.current.geometry.attributes.position.array[i3 + 2]
       };
 
-      // Équations de Halvorsen pour les points de référence
+      // Équations de Halvorsen avec le timestep variable
       const dx = refPos.y * timestep;
       const dy = refPos.z * timestep;
       const dz = (-a*refPos.x -b*refPos.y -refPos.z + (d* (Math.pow(refPos.x, 3)))) * timestep;
@@ -169,7 +179,7 @@ const CustomGeometryParticles = (props) => {
       const t = Math.max(0, Math.min(1, timeSinceInteraction * returnSpeed));
       const mixFactor = t * t * t; // Garde la progression cubique pour la douceur
 
-      if (distToMouse > 0) {
+      if (distToMouse > 0 && 1==0) {
         // Calculer la distance à l'origine
         const distToOrigin = Math.sqrt(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
         
@@ -202,6 +212,17 @@ const CustomGeometryParticles = (props) => {
       }
     }
 
+    // Mise à jour des positions des sphères leaders
+    sphereRefs.current.forEach((sphere, index) => {
+      if (sphere) {
+        sphere.position.set(
+          points.current.geometry.attributes.position.array[index * leaderFrequency * 3],
+          points.current.geometry.attributes.position.array[index * leaderFrequency * 3 + 1],
+          points.current.geometry.attributes.position.array[index * leaderFrequency * 3 + 2]
+        );
+      }
+    });
+
     points.current.geometry.attributes.position.needsUpdate = true;
     referencePoints.current.geometry.attributes.position.needsUpdate = true;
   });
@@ -216,9 +237,34 @@ const CustomGeometryParticles = (props) => {
             array={particlesPosition}
             itemSize={3}
           />
+          <bufferAttribute
+            attach="attributes-size"
+            count={particlesPosition.length / 3}
+            array={new Float32Array(particlesPosition.length / 3).map((_, i) => 
+              i % leaderFrequency === 0 ? 50.0 : 20.0
+            )}
+            itemSize={1}
+          />
         </bufferGeometry>
         <shaderMaterial
-          vertexShader={vertexShader}
+          vertexShader={`
+            attribute float size;
+            uniform float uTime;
+            uniform vec2 uMouse;
+            varying float vDistance;
+
+            void main() {
+              vec4 modelPosition = modelMatrix * vec4(position, 1.0);
+              vec4 viewPosition = viewMatrix * modelPosition;
+              vec4 projectedPosition = projectionMatrix * viewPosition;
+
+              vec2 screenPosition = projectedPosition.xy / projectedPosition.w;
+              vDistance = length(screenPosition - uMouse);
+
+              gl_Position = projectedPosition;
+              gl_PointSize = size * (1.0 / -viewPosition.z);
+            }
+          `}
           fragmentShader={fragmentShader}
           uniforms={uniforms}
           transparent={true}
@@ -235,12 +281,33 @@ const CustomGeometryParticles = (props) => {
           />
         </bufferGeometry>
       </points>
+      <group>
+        {Array(Math.floor(count/leaderFrequency)).fill(null).map((_, index) => (
+          <mesh
+            key={index}
+            ref={el => sphereRefs.current[index] = el}
+            position={[
+              points.current?.geometry.attributes.position.array[index * leaderFrequency * 3] || 0,
+              points.current?.geometry.attributes.position.array[index * leaderFrequency * 3 + 1] || 0,
+              points.current?.geometry.attributes.position.array[index * leaderFrequency * 3 + 2] || 0
+            ]}
+          >
+            <sphereGeometry args={[0.01, 16, 16]} />
+            <meshBasicMaterial
+             color={[0, 127, 255]}
+              // emissive="#0000ff"
+              // emissiveIntensity={2}
+              toneMapped={false}
+            />
+          </mesh>
+        ))}
+      </group>
     </>
   );
 };
 
 const Scene2 = () => {
-  const sphere = new THREE.SphereGeometry(1, 32, 32);
+  const sphere = new THREE.SphereGeometry(0.01, 32, 32);
 
   const transmissionProps = useControls('Transmission Material', {
     transmission: { value: 1, min: 0, max: 1 },
@@ -260,14 +327,20 @@ const Scene2 = () => {
 
   return (
     <div className="bg-black" style={{ width: '100%', height: '100vh' }}>
-      <Canvas camera={{ position: [1.5, 1.5, 1.5] }}>
+      <Canvas camera={{ position: [-10, -4, 1.5] }}>
         <ambientLight intensity={0.5} />
-        <CustomGeometryParticles count={2000} />
-        {/* <mesh geometry={sphere}>
-          <MeshTransmissionMaterial {...transmissionProps} />
-        </mesh> */}
+        <CustomGeometryParticles count={20000} />
+        <EffectComposer>
+          <Bloom 
+            threshold={0.1}
+            strength={0.1}
+            radius={0.01}
+            luminanceThreshold={0.1}
+            luminanceSmoothing={0.1}
+          />
+        </EffectComposer>
         <OrbitControls />
-        <axesHelper args={[1]} />
+        {/* <axesHelper args={[1]} /> */}
       </Canvas>
     </div>
   );
